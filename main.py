@@ -12,10 +12,17 @@ from aiogram.types import (
     InlineKeyboardButton, 
     LabeledPrice, 
     Message, 
-    CallbackQuery
+    CallbackQuery,
+    WebAppInfo
 )
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
+
+# --- Импорты для связи с сайтом (Web App API) ---
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+import uvicorn
 
 # --- НАСТРОЙКИ И КОНФИГУРАЦИЯ ---
 # Токен бота
@@ -29,6 +36,9 @@ PHOTO_URL = "https://i.ibb.co/4R8pgL5J/Picsart-26-06-12-14-38-12-376.jpg"
 
 # Курс конвертации
 STAR_TO_USDT_RATE = 400
+
+# ССЫЛКА НА ТВОЙ САЙТ (Поменяй на свою ссылку, где развернут index.html)
+WEBAPP_URL = "https://твой-сайт.com"
 
 # Конфигурация кейсов (Название: [Цена, Мин. выигрыш, Макс. выигрыш])
 CASES_CONFIG = {
@@ -46,6 +56,23 @@ logging.basicConfig(
 # Инициализация бота и диспетчера
 bot = Bot(token=API_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
+
+# --- НАСТРОЙКА СЕРВЕРА СИНХРОНИЗАЦИИ (API ДЛЯ САЙТА) ---
+app = FastAPI()
+
+# Разрешаем сайту брать данные из бота без ошибок CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Модель данных для валидации приходящих запросов с сайта
+class UpdateBalanceModel(BaseModel):
+    user_id: int
+    balance: float
 
 # --- УПРАВЛЕНИЕ БАЗОЙ ДАННЫХ ---
 
@@ -96,11 +123,29 @@ async def set_last_daily_bonus(user_id: int, timestamp: int):
         await db.execute("UPDATE users SET last_daily = ? WHERE user_id = ?", (timestamp, user_id))
         await db.commit()
 
+# --- ЭНДПОИНТЫ ДЛЯ САЙТА (API) ---
+
+# Строчка (эндпоинт), по которой сайт будет запрашивать баланс (GET)
+@app.get("/api/get_balance/{user_id}")
+async def api_get_balance(user_id: int):
+    balance, _ = await get_user_profile(user_id)
+    return {"balance": balance}
+
+# Строчка (эндпоинт), по которой сайт будет сохранять измененный баланс (POST)
+@app.post("/api/update_balance")
+async def api_update_balance(data: UpdateBalanceModel):
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute("UPDATE users SET balance = ? WHERE user_id = ?", (data.balance, data.user_id))
+        await db.commit()
+        logging.info(f"Сайт успешно обновил баланс пользователя {data.user_id} на {data.balance} USDT")
+    return {"status": "success"}
+
 # --- ФУНКЦИИ КЛАВИАТУР ---
 
 def generate_main_keyboard() -> InlineKeyboardMarkup:
     """Генерирует главное меню бота."""
     return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📱 Открыть Кошелек (Web)", web_app=WebAppInfo(url=WEBAPP_URL))],
         [InlineKeyboardButton(text="Кошелек", callback_data="wallet")],
         [InlineKeyboardButton(text="Кейсы", callback_data="cases_menu")],
         [InlineKeyboardButton(text="Бонус (24ч)", callback_data="daily")],
@@ -119,6 +164,20 @@ def generate_back_keyboard() -> InlineKeyboardMarkup:
 async def cmd_start(message: Message, state: FSMContext):
     """Обработка команды /start."""
     await state.clear()
+    
+    # Если пользователь перешел с сайта по кнопке "Пополнить", сразу кидаем инвойс звезд
+    if message.text == "/start buy_usdt":
+        await bot.send_invoice(
+            chat_id=message.chat.id,
+            title="Пополнение баланса",
+            description="Купить USDT за звезды (1 звезда = 400 USDT)",
+            payload="buy_stars_payload",
+            currency="XTR",
+            prices=[LabeledPrice(label="Пополнение баланса", amount=1)],
+            provider_token=""
+        )
+        return
+
     await get_user_profile(message.from_user.id)
     
     text = (
@@ -146,7 +205,7 @@ async def callback_show_wallet(callback: CallbackQuery):
     """Отображение баланса пользователя."""
     balance, _ = await get_user_profile(callback.from_user.id)
     await callback.message.edit_caption(
-        caption=f"Ваш баланс: {balance:.2f} USDT.", 
+        caption=f"Ваш баланс: {balance:.2f} USDT.",
         reply_markup=generate_back_keyboard()
     )
 
@@ -225,49 +284,19 @@ async def process_successful_payment(message: Message):
     await update_user_balance(message.from_user.id, float(usdt_received))
     await message.answer(f"Оплата прошла успешно! Баланс пополнен на {usdt_received} USDT.")
 
-# --- ТОЧКА ВХОДА ---
+# --- ТОЧКА ВХОДА И ЗАПУСК ---
 
 async def main():
-    """Основная функция запуска бота."""
-    await initialize_database()
-    logging.info("Бот Criptynum запущен и ожидает сообщений.")
-    await dp.start_polling(bot)
-
-if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except Exception as e:
-        logging.error(f"Критическая ошибка: {e}")
-        # --- ДОБАВЬ ЭТОТ БЛОК В САМЫЙ КОНЕЦ ФАЙЛА К БОТУ ---
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
-import uvicorn
-
-app = FastAPI()
-
-# Разрешаем сайту брать данные из бота
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# Строчка (эндпоинт), по которой сайт будет запрашивать баланс
-@app.get("/api/get_balance/{user_id}")
-async def api_get_balance(user_id: int):
-    balance, _ = await get_user_profile(user_id)
-    return {"balance": balance}
-
-async def main():
+    """Основная функция запуска бота и веб-синхронизации."""
     await initialize_database()
     
-    # Запуск веб-части параллельно с ботом на порту 8000
+    # Настройка и запуск FastAPI веб-сервера параллельно с ботом на порту 8000
     config = uvicorn.Config(app, host="0.0.0.0", port=8000, loop="asyncio")
     server = uvicorn.Server(config)
     
-    logging.info("Бот и веб-синхронизация запущены!")
+    logging.info("Бот Criptynum и веб-синхронизация успешно запущены!")
+    
+    # Запускаем поллинг бота и сервер API одновременно в одном цикле событий
     await asyncio.gather(
         dp.start_polling(bot),
         server.serve()
@@ -278,5 +307,4 @@ if __name__ == "__main__":
         asyncio.run(main())
     except Exception as e:
         logging.error(f"Критическая ошибка: {e}")
-        
-        
+    
