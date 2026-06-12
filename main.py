@@ -1,283 +1,186 @@
 import asyncio
-import aiosqlite
 import logging
-import sys
-import os
 import random
-from datetime import datetime
-from typing import Union, Optional
-
+import time
+import aiosqlite
 from aiogram import Bot, Dispatcher, types, F
-from aiogram.filters import Command, StateFilter
-from aiogram.utils.keyboard import InlineKeyboardBuilder
-from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.fsm.state import State, StatesGroup
+from aiogram.filters import Command
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, WebAppInfo
 from aiogram.fsm.context import FSMContext
-from aiogram.client.bot import DefaultBotProperties
-from aiogram.types import LabeledPrice, PreCheckoutQuery, Message, CallbackQuery
-from aiohttp import web
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
 
-# ==========================================
-# КРИТИЧЕСКИЕ НАСТРОЙКИ REDVIDEO
-# ==========================================
-TOKEN = '8725627105:AAFgdBu8u-AYlHRaGtFLUP12uvqGDJRsuco'
-ADMIN_ID = 6907295206 
-DEV_USERNAME = "@redperr"
+# --- КОНФИГУРАЦИЯ ---
+API_TOKEN = "8661823879:AAEu2iKk00Hk499ga8mDGYN3jnIvdKua2Rc"
+DB_NAME = "criptynum.db"
 
-# Ресурсы (Картинки проекта)
-START_PIC = "https://i.postimg.cc/3NbWzvGj/Frame_1187517897.png"
-ADMIN_PIC = "https://i.postimg.cc/FzK7PZYd/Frame-1187517898.png"
+# Настройка логирования
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 
-# Путь к базе данных (оптимизировано под Render Volumes)
-DB_PATH = '/data/redvideo_final.db' if os.path.exists('/data') else 'redvideo_final.db'
-
-# Настройка глубокого логирования
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)]
-)
-logger = logging.getLogger("RedVideo_Engine")
-
-# Инициализация бота и диспетчера
-bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
+bot = Bot(token=API_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
-# Состояния системы (FSM)
-class RedStates(StatesGroup):
-    WAITING_BAN = State()
-    WAITING_UNBAN = State()
-    WAITING_REPLY = State()
+# --- СОСТОЯНИЯ (FSM) ---
+class WalletStates(StatesGroup):
+    waiting_for_transfer_recipient = State()
+    waiting_for_transfer_amount = State()
+    waiting_for_deposit_amount = State()
 
-# ==========================================
-# СЛОЙ ДАННЫХ (DATABASE LAYER)
-# ==========================================
-async def db_initialize():
-    """Создание таблиц с расширенной структурой"""
-    async with aiosqlite.connect(DB_PATH) as db:
-        # Хранилище видео
-        await db.execute('''CREATE TABLE IF NOT EXISTS red_content 
-                            (id INTEGER PRIMARY KEY AUTOINCREMENT, 
-                             file_id TEXT NOT NULL, 
-                             owner_id INTEGER NOT NULL, 
-                             timestamp DATETIME)''')
-        # Реестр пользователей
-        await db.execute('''CREATE TABLE IF NOT EXISTS red_users 
-                            (user_id INTEGER PRIMARY KEY, 
-                             username TEXT, 
-                             quota INTEGER DEFAULT 0, 
-                             is_banned INTEGER DEFAULT 0)''')
+# --- КЛАВИАТУРЫ ---
+def get_main_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💰 Баланс / Кошелек", callback_data="wallet")],
+        [InlineKeyboardButton(text="🎁 Открыть кейс", callback_data="cases")],
+        [InlineKeyboardButton(text="⚡️ Ежедневный бонус", callback_data="daily")],
+        [InlineKeyboardButton(text="💸 Перевести", callback_data="transfer")],
+        [InlineKeyboardButton(text="💳 Пополнить", callback_data="deposit")],
+        [InlineKeyboardButton(text="📱 Mini-App", web_app=WebAppInfo(url="https://example.com"))]
+    ])
+
+def get_back_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⬅️ Назад в меню", callback_data="main_menu")]
+    ])
+
+# --- БАЗА ДАННЫХ И ХЕЛПЕРЫ ---
+async def init_db():
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                balance REAL DEFAULT 100.0,
+                last_daily INTEGER DEFAULT 0
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS transactions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                amount REAL,
+                type TEXT,
+                timestamp DATETIME
+            )
+        """)
         await db.commit()
-    logger.info("RedVideo DB: Система инициализирована.")
 
-async def check_user_access(user_id: int):
-    """Проверка прав доступа пользователя"""
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT is_banned, quota FROM red_users WHERE user_id = ?", (user_id,)) as cur:
-            return await cur.fetchone()
+async def get_user(user_id):
+    async with aiosqlite.connect(DB_NAME) as db:
+        cursor = await db.execute("SELECT balance, last_daily FROM users WHERE user_id = ?", (user_id,))
+        row = await cursor.fetchone()
+        if not row:
+            await db.execute("INSERT INTO users (user_id) VALUES (?)", (user_id,))
+            await db.commit()
+            return 100.0, 0
+        return row
 
-# ==========================================
-# ИНТЕРФЕЙСЫ (UI GENERATORS)
-# ==========================================
-class RedUI:
-    @staticmethod
-    def main_menu():
-        builder = InlineKeyboardBuilder()
-        builder.row(types.InlineKeyboardButton(text="💎 Поддержать RedVideo (5 ⭐)", callback_data="stars_pay"))
-        return builder.as_markup()
+async def update_balance(user_id, amount, operation="add"):
+    async with aiosqlite.connect(DB_NAME) as db:
+        if operation == "add":
+            await db.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (amount, user_id))
+        else:
+            await db.execute("UPDATE users SET balance = balance - ? WHERE user_id = ?", (amount, user_id))
+        await db.commit()
 
-    @staticmethod
-    def admin_panel():
-        builder = InlineKeyboardBuilder()
-        builder.row(types.InlineKeyboardButton(text="📊 Аналитика Системы", callback_data="adm_stats_show"))
-        builder.row(
-            types.InlineKeyboardButton(text="🚫 Забанить", callback_data="adm_ban_start"),
-            types.InlineKeyboardButton(text="🔓 Разбанить", callback_data="adm_unban_start")
-        )
-        builder.row(types.InlineKeyboardButton(text="🧹 Полная очистка базы", callback_data="adm_clear_data"))
-        return builder.as_markup()
-
-    @staticmethod
-    def video_controls(v_id: int):
-        builder = InlineKeyboardBuilder()
-        builder.row(
-            types.InlineKeyboardButton(text="❤️", callback_data="feed_next"),
-            types.InlineKeyboardButton(text="❌", callback_data="feed_next")
-        )
-        builder.row(
-            types.InlineKeyboardButton(text="💬 Ответить", callback_data=f"rep_{v_id}"),
-            types.InlineKeyboardButton(text="🚩 Жалоба", callback_data=f"report_{v_id}")
-        )
-        return builder.as_markup()
-
-# ==========================================
-# ОСНОВНАЯ ЛОГИКА (HANDLERS)
-# ==========================================
+# --- ОБРАБОТЧИКИ ---
 
 @dp.message(Command("start"))
-async def start_handler(message: Message):
-    uid = message.from_user.id
-    uname = (message.from_user.username or f"id{uid}").lower()
+async def start_cmd(message: types.Message, state: FSMContext):
+    await state.clear()
+    await get_user(message.from_user.id)
+    text = (
+        f"Приветствуем, {message.from_user.full_name}\n"
+        f"Вы попали в крипто-кошелёк Criptynum\n"
+        f"Что сегодня желаете сделать?"
+    )
+    await message.answer(text, reply_markup=get_main_kb())
+
+@dp.callback_query(F.data == "main_menu")
+async def main_menu(callback: types.CallbackQuery, state: FSMContext):
+    await state.clear()
+    await callback.message.edit_text("Главное меню:", reply_markup=get_main_kb())
+
+@dp.callback_query(F.data == "wallet")
+async def show_wallet(callback: types.CallbackQuery):
+    balance, _ = await get_user(callback.from_user.id)
+    await callback.message.edit_text(
+        f"💳 Ваш баланс: {balance:.2f} монет.\n\n"
+        f"Статус: Активен.",
+        reply_markup=get_back_kb()
+    )
+
+@dp.callback_query(F.data == "daily")
+async def daily_bonus(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    balance, last_daily = await get_user(user_id)
     
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("INSERT OR IGNORE INTO red_users (user_id, username) VALUES (?, ?)", (uid, uname))
+    current_time = int(time.time())
+    if current_time - last_daily < 86400:
+        remaining = 86400 - (current_time - last_daily)
+        await callback.answer(f"Бонус можно получить через {remaining//3600} ч.", show_alert=True)
+        return
+
+    bonus = random.randint(50, 200)
+    await update_balance(user_id, bonus, "add")
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute("UPDATE users SET last_daily = ? WHERE user_id = ?", (current_time, user_id))
         await db.commit()
     
-    welcome_text = (
-        f"🌟 <b>Добро пожаловать в RedVideo, {message.from_user.first_name}!</b>\n\n"
-        f"Запиши кружок — получишь случайный в ответ!\n\n"
-        f"💡 <b>Правила проекта:</b>\n"
-        f"— 1 кружок открывает 3 просмотра ленты.\n"
-        f"— Запрещен спам и оскорбления.\n\n"
-        f"Жду твой первый кружок! 👇"
-    )
+    await callback.message.edit_text(f"Вы получили ежедневный бонус: {bonus} монет!", reply_markup=get_back_kb())
+
+@dp.callback_query(F.data == "cases")
+async def open_case(callback: types.CallbackQuery):
+    balance, _ = await get_user(callback.from_user.id)
+    cost = 50
+    if balance < cost:
+        await callback.answer("Недостаточно средств (кейс стоит 50).", show_alert=True)
+        return
+    
+    win = random.randint(0, 150)
+    await update_balance(callback.from_user.id, cost - win, "add") # Если win < cost, баланс уменьшится
+    await callback.message.edit_text(f"Кейс открыт. Ваш выигрыш: {win} монет.", reply_markup=get_back_kb())
+
+@dp.callback_query(F.data == "transfer")
+async def transfer_start(callback: types.CallbackQuery, state: FSMContext):
+    await callback.message.edit_text("Введите ID получателя (число):", reply_markup=get_back_kb())
+    await state.set_state(WalletStates.waiting_for_transfer_recipient)
+
+@dp.message(WalletStates.waiting_for_transfer_recipient)
+async def process_transfer_recipient(message: types.Message, state: FSMContext):
+    if not message.text.isdigit():
+        await message.answer("ID должен быть числом.")
+        return
+    await state.update_data(recipient=int(message.text))
+    await message.answer("Введите сумму для перевода:", reply_markup=get_back_kb())
+    await state.set_state(WalletStates.waiting_for_transfer_amount)
+
+@dp.message(WalletStates.waiting_for_transfer_amount)
+async def process_transfer_amount(message: types.Message, state: FSMContext):
     try:
-        await message.answer_photo(photo=START_PIC, caption=welcome_text, reply_markup=RedUI.main_menu())
-    except Exception as e:
-        logger.error(f"UI Error: {e}")
-        await message.answer(welcome_text, reply_markup=RedUI.main_menu())
-
-# --- ОБРАБОТКА КОНТЕНТА ---
-@dp.message(F.video_note)
-async def video_handler(message: Message):
-    uid = message.from_user.id
-    uname = (message.from_user.username or f"id{uid}").lower()
-    
-    status = await check_user_access(uid)
-    if status and status[0] == 1:
-        return await message.answer("🚫 <b>Доступ заблокирован администратором.</b>")
-
-    async with aiosqlite.connect(DB_PATH) as db:
-        # Сохранение видео
-        await db.execute("INSERT INTO red_content (file_id, owner_id, timestamp) VALUES (?, ?, ?)", 
-                         (message.video_note.file_id, uid, datetime.now()))
-        # Выдача квоты
-        await db.execute("INSERT OR REPLACE INTO red_users (user_id, username, quota, is_banned) VALUES (?, ?, 3, 0)", 
-                         (uid, uname, 3, 0))
-        await db.commit()
+        amount = float(message.text)
+        data = await state.get_data()
+        recipient = data['recipient']
         
-        # Поиск случайного видео
-        async with db.execute("SELECT id, file_id FROM red_content WHERE owner_id != ? ORDER BY RANDOM() LIMIT 1", (uid,)) as cur:
-            video_data = await cur.fetchone()
-        
-        if video_data:
-            await message.answer_video_note(video_data[1], reply_markup=RedUI.video_controls(video_data[0]))
+        balance, _ = await get_user(message.from_user.id)
+        if amount > balance:
+            await message.answer("Недостаточно средств.")
         else:
-            await message.answer("📽 <b>RedVideo:</b> Кружок принят! Ты первый в базе, ждем других участников.")
+            await update_balance(message.from_user.id, amount, "sub")
+            await update_balance(recipient, amount, "add")
+            await message.answer(f"Успешно переведено {amount} монет пользователю {recipient}.")
+        await state.clear()
+        await message.answer("Возврат в главное меню:", reply_markup=get_main_kb())
+    except ValueError:
+        await message.answer("Ошибка: сумма должна быть числом.")
 
-@dp.callback_query(F.data == "feed_next")
-async def next_video_handler(call: CallbackQuery):
-    uid = call.from_user.id
-    status = await check_user_access(uid)
-    
-    if not status: return
-    if status[0] == 1: return await call.answer("🚫 Аккаунт заблокирован.", show_alert=True)
-    if status[1] <= 0 and uid != ADMIN_ID:
-        return await call.answer("🔋 Лимит исчерпан! Запиши кружок, чтобы смотреть дальше.", show_alert=True)
-
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT id, file_id FROM red_content WHERE owner_id != ? ORDER BY RANDOM() LIMIT 1", (uid,)) as cur:
-            video_data = await cur.fetchone()
-        
-        if video_data:
-            if uid != ADMIN_ID:
-                await db.execute("UPDATE red_users SET quota = quota - 1 WHERE user_id = ?", (uid,))
-                await db.commit()
-            await call.message.answer_video_note(video_data[1], reply_markup=RedUI.video_controls(video_data[0]))
-        else:
-            await call.answer("RedVideo: Кружки закончились.", show_alert=True)
-    await call.answer()
-
-# ==========================================
-# АДМИНИСТРАТИВНЫЙ МОДУЛЬ (ПОЛНЫЙ)
-# ==========================================
-
-@dp.message(Command("admin"))
-async def admin_main(message: Message):
-    if message.from_user.id != ADMIN_ID: return
-    await message.answer_photo(photo=ADMIN_PIC, caption="🛠 <b>Панель управления RedVideo</b>", reply_markup=RedUI.admin_panel())
-
-@dp.callback_query(F.data == "adm_stats_show")
-async def admin_stats(call: CallbackQuery):
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT COUNT(*) FROM red_content") as c1: vc = (await c1.fetchone())[0]
-        async with db.execute("SELECT COUNT(*) FROM red_users") as c2: uc = (await c2.fetchone())[0]
-    await call.message.answer(f"📊 <b>Статистика RedVideo:</b>\n\nВсего видео: {vc}\nПользователей: {uc}")
-    await call.answer()
-
-# --- ЛОГИКА БАНА / РАЗБАНА ---
-@dp.callback_query(F.data == "adm_ban_start")
-async def ban_start(call: CallbackQuery, state: FSMContext):
-    await call.message.answer("Введите username (без @) для блокировки:")
-    await state.set_state(RedStates.WAITING_BAN)
-    await call.answer()
-
-@dp.message(RedStates.WAITING_BAN)
-async def ban_execute(message: Message, state: FSMContext):
-    target = message.text.replace("@", "").lower().strip()
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("UPDATE red_users SET is_banned = 1 WHERE username = ?", (target,))
-        await db.commit()
-    await message.answer(f"🚫 Пользователь <b>{target}</b> успешно забанен.")
-    await state.clear()
-
-@dp.callback_query(F.data == "adm_unban_start")
-async def unban_start(call: CallbackQuery, state: FSMContext):
-    await call.message.answer("Введите username (без @) для разблокировки:")
-    await state.set_state(RedStates.WAITING_UNBAN)
-    await call.answer()
-
-@dp.message(RedStates.WAITING_UNBAN)
-async def unban_execute(message: Message, state: FSMContext):
-    target = message.text.replace("@", "").lower().strip()
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("UPDATE red_users SET is_banned = 0 WHERE username = ?", (target,))
-        await db.commit()
-    await message.answer(f"🔓 Пользователь <b>{target}</b> разблокирован.")
-    await state.clear()
-
-@dp.callback_query(F.data == "adm_clear_data")
-async def admin_purge(call: CallbackQuery):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("DELETE FROM red_content")
-        await db.commit()
-    await call.answer("💥 База видео полностью очищена!", show_alert=True)
-
-# --- ПЛАТЕЖИ (STARS) ---
-@dp.callback_query(F.data == "stars_pay")
-async def stars_invoice(call: CallbackQuery):
-    await bot.send_invoice(
-        call.from_user.id, "Поддержка RedVideo", "Донат 5 звезд", "payload_rv", "XTR", [LabeledPrice("Звезды", 5)]
-    )
-    await call.answer()
-
-@dp.pre_checkout_query()
-async def pre_checkout(q: PreCheckoutQuery):
-    await q.answer(ok=True)
-
-# ==========================================
-# СЕРВИСНЫЙ СЛОЙ
-# ==========================================
-async def handle_ping(request):
-    return web.Response(text="RedVideo Core: Online")
-
-async def run_server():
-    app = web.Application()
-    app.router.add_get("/", handle_ping)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    await web.TCPSite(runner, "0.0.0.0", int(os.environ.get("PORT", 8080))).start()
-
+# --- ЗАПУСК ---
 async def main():
-    await db_initialize()
-    asyncio.create_task(run_server())
-    await bot.delete_webhook(drop_pending_updates=True)
-    logger.info("RedVideo Engine: Бот запущен.")
+    await init_db()
+    logging.info("Criptynum запущен и готов к работе.")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
-    except (KeyboardInterrupt, SystemExit):
-        logger.info("Система остановлена.")
-    
+    except Exception as e:
+        logging.error(f"Ошибка при запуске: {e}")
+        
