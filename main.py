@@ -19,7 +19,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 
 # --- НАСТРОЙКИ И КОНФИГУРАЦИЯ ---
 # Токен бота
-API_TOKEN = "8661823879:AAEu2iKk00Hk499ga8mDGYN3jnIvdKua2Rc"
+API_TOKEN = "8661823879:AAE-YUL5xOxmrzM6merb2oqm5cIKR8JtTD4"
 
 # Имя файла базы данных
 DB_NAME = "criptynum.db"
