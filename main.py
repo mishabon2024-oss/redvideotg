@@ -238,4 +238,45 @@ if __name__ == "__main__":
         asyncio.run(main())
     except Exception as e:
         logging.error(f"Критическая ошибка: {e}")
+        # --- ДОБАВЬ ЭТОТ БЛОК В САМЫЙ КОНЕЦ ФАЙЛА К БОТУ ---
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+import uvicorn
+
+app = FastAPI()
+
+# Разрешаем сайту брать данные из бота
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Строчка (эндпоинт), по которой сайт будет запрашивать баланс
+@app.get("/api/get_balance/{user_id}")
+async def api_get_balance(user_id: int):
+    balance, _ = await get_user_profile(user_id)
+    return {"balance": balance}
+
+async def main():
+    await initialize_database()
+    
+    # Запуск веб-части параллельно с ботом на порту 8000
+    config = uvicorn.Config(app, host="0.0.0.0", port=8000, loop="asyncio")
+    server = uvicorn.Server(config)
+    
+    logging.info("Бот и веб-синхронизация запущены!")
+    await asyncio.gather(
+        dp.start_polling(bot),
+        server.serve()
+    )
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except Exception as e:
+        logging.error(f"Критическая ошибка: {e}")
+        
         
