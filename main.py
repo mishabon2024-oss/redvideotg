@@ -26,7 +26,7 @@ import uvicorn
 
 # --- НАСТРОЙКИ И КОНФИГУРАЦИЯ ---
 # Токен бота
-API_TOKEN = "8661823879:AAE-YUL5xOxmrzM6merb2oqm5cIKR8JtTD4"
+API_TOKEN = "8725627105:AAFgdBu8u-AYlHRaGtFLUP12uvqGDJRsuco"
 
 # Имя файла базы данных
 DB_NAME = "criptynum.db"
